@@ -1,0 +1,7 @@
+name: astrbot_plugin_token_faucet
+display_name: 链上游戏币
+desc: 每日签到赚取游戏币，可提现为 Sepolia 链上 ERC-20 代币，支持钱包绑定与每日全局限额
+version: v0.1.0
+author: GuJi08233
+repo: https://github.com/GuJi08233/astrbot_plugin_token_faucet
+astrbot_version: ">=4.16,<5"

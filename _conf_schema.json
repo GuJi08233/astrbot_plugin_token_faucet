@@ -1,0 +1,107 @@
+{
+  "chain": {
+    "description": "链上配置",
+    "type": "object",
+    "items": {
+      "rpc_url": {
+        "description": "以太坊 RPC 节点地址",
+        "hint": "Sepolia 测试网。公共节点限流较严，建议使用 Alchemy / Infura 的专属节点以保证提现稳定。",
+        "type": "string",
+        "default": "https://ethereum-sepolia-rpc.publicnode.com"
+      },
+      "chain_id": {
+        "description": "链 ID",
+        "hint": "Sepolia 为 11155111，以太坊主网为 1。必须与 RPC 节点所在的网络一致。",
+        "type": "int",
+        "default": 11155111
+      },
+      "token_address": {
+        "description": "代币合约地址",
+        "hint": "ERC-20 合约地址。默认值为「游戏币」(✦) 在 Sepolia 上的合约。",
+        "type": "string",
+        "default": "0x64bf89340562ab4fe829a481e6797b012664425b"
+      },
+      "token_decimals": {
+        "description": "代币精度 (decimals)",
+        "hint": "「游戏币」的 decimals 为 0，即代币不可拆分，1 币在链上就是整数 1。更换代币时必须改成对应合约的真实值，填错会导致转账金额相差若干个数量级。",
+        "type": "int",
+        "default": 0
+      },
+      "private_key": {
+        "description": "热钱包私钥",
+        "hint": "用于发放代币的钱包私钥，可带或不带 0x 前缀。该私钥以明文保存在 data/config 下，请仅使用专用的测试网钱包，切勿填入持有主网资产的私钥。",
+        "obvious_hint": true,
+        "type": "string",
+        "default": ""
+      },
+      "gas_limit": {
+        "description": "转账 Gas 上限",
+        "hint": "标准 ERC-20 transfer 约消耗 5 万 Gas，12 万足够覆盖。",
+        "type": "int",
+        "default": 120000
+      },
+      "request_timeout": {
+        "description": "RPC 请求超时（秒）",
+        "type": "int",
+        "default": 30
+      },
+      "receipt_timeout": {
+        "description": "等待链上确认超时（秒）",
+        "hint": "超时后交易仍可能被打包，因此不会退款，记录保持「已广播」状态。",
+        "type": "int",
+        "default": 180
+      },
+      "explorer_base": {
+        "description": "区块浏览器地址",
+        "hint": "用于拼接交易链接，留空则只显示交易哈希。",
+        "type": "string",
+        "default": "https://sepolia.etherscan.io"
+      }
+    }
+  },
+  "faucet": {
+    "description": "签到与提现规则",
+    "type": "object",
+    "items": {
+      "token_symbol": {
+        "description": "代币显示名称",
+        "hint": "仅影响机器人回复中的文案。",
+        "type": "string",
+        "default": "游戏币"
+      },
+      "daily_global_limit": {
+        "description": "每日全局提现上限",
+        "hint": "所有用户当天提现总量的上限。失败并已退款的提现不占用额度。",
+        "type": "int",
+        "default": 1000
+      },
+      "checkin_min": {
+        "description": "签到最少获得",
+        "type": "int",
+        "default": 1
+      },
+      "checkin_max": {
+        "description": "签到最多获得",
+        "type": "int",
+        "default": 3
+      },
+      "min_withdraw": {
+        "description": "单次提现最小数量",
+        "type": "int",
+        "default": 1
+      },
+      "max_withdraw": {
+        "description": "单次提现最大数量",
+        "hint": "防止单个用户一次性抽空当日额度。",
+        "type": "int",
+        "default": 100
+      },
+      "day_utc_offset": {
+        "description": "每日重置时区偏移（UTC±N 小时）",
+        "hint": "决定签到与全局额度在几点重置。8 表示按北京时间 0 点重置。",
+        "type": "int",
+        "default": 8
+      }
+    }
+  }
+}
