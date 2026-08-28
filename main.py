@@ -517,10 +517,13 @@ class TokenFaucet(Star):
             yield event.plain_result("链上查询失败，请稍后再试。")
             return
 
+        chain_id = self._int_cfg(self._chain_cfg(), "chain_id", 11155111)
         yield event.plain_result(
             f"{info['name']}（{info['symbol']}）\n"
-            f"总量：{info['total_supply']}\n"
+            f"链 ID：{chain_id}\n"
             f"合约地址：{client.token_address}\n"
+            f"精度（decimals）：{info['decimals']}\n"
+            f"总量：{info['total_supply']}\n"
             f"分发钱包余额：{pool_balance}\n"
             f"今日剩余提现额度：{max(limit - used, 0)}/{limit}",
         )
