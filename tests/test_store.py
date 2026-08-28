@@ -223,19 +223,15 @@ async def test_wallet_binding_roundtrip(store: FaucetStore):
 
 @pytest.mark.asyncio
 async def test_list_bound_wallets(store: FaucetStore):
-    await store.set_wallet("p:alice", "0xaaaa", "Alice")
-    await store.set_wallet("p:bob", "0xbbbb", "Bob")
-    await _credit(store, "p:carol", 5)  # has balance but no wallet
+    await store.set_wallet("111", "0xaaaa")
+    await store.set_wallet("222", "0xbbbb")
+    await _credit(store, "333", 5)  # has balance but no wallet
 
     bound = sorted(await store.list_bound_wallets())
-    assert bound == [("p:alice", "Alice", "0xaaaa"), ("p:bob", "Bob", "0xbbbb")]
+    assert bound == [("111", "0xaaaa"), ("222", "0xbbbb")]
 
-    # Unbinding with no name must clear the wallet but keep the stored name.
-    await store.set_wallet("p:alice", None)
-    bound = await store.list_bound_wallets()
-    assert bound == [("p:bob", "Bob", "0xbbbb")]
-    alice = await store.get_user("p:alice")
-    assert alice.wallet is None
+    await store.set_wallet("111", None)
+    assert await store.list_bound_wallets() == [("222", "0xbbbb")]
 
 
 def test_current_day_uses_offset():

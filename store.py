@@ -132,7 +132,7 @@ class FaucetStore:
         """Return a user's record, or an empty record when unknown.
 
         Args:
-            user_key: Stable ``platform:sender_id`` identifier.
+            user_key: Stable sender identifier.
 
         Returns:
             The stored record, or a zeroed record for first-time users.
@@ -170,7 +170,7 @@ class FaucetStore:
         relying on a read-then-write race.
 
         Args:
-            user_key: Stable ``platform:sender_id`` identifier.
+            user_key: Stable sender identifier.
             display_name: Latest known nickname, refreshed on every check-in.
             day: Faucet day string from :func:`current_day`.
             amount: Number of tokens to credit.
@@ -232,50 +232,40 @@ class FaucetStore:
                 raise
         return True, int(row["balance"]) if row else amount
 
-    async def set_wallet(
-        self,
-        user_key: str,
-        wallet: str | None,
-        display_name: str | None = None,
-    ) -> None:
+    async def set_wallet(self, user_key: str, wallet: str | None) -> None:
         """Bind or clear a user's payout address.
 
         Args:
-            user_key: Stable ``platform:sender_id`` identifier.
+            user_key: Stable sender identifier.
             wallet: Checksummed address, or ``None`` to unbind.
-            display_name: Latest known nickname; kept unchanged when ``None``.
         """
         now = int(time.time())
         async with self._lock:
             await self._conn.execute(
                 """
-                INSERT INTO users (user_key, wallet, display_name,
-                                   created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO users (user_key, wallet, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(user_key) DO UPDATE SET
                     wallet = excluded.wallet,
-                    display_name = COALESCE(
-                        excluded.display_name, users.display_name),
                     updated_at = excluded.updated_at
                 """,
-                (user_key, wallet, display_name, now, now),
+                (user_key, wallet, now, now),
             )
             await self._conn.commit()
 
-    async def list_bound_wallets(self) -> list[tuple[str, str | None, str]]:
+    async def list_bound_wallets(self) -> list[tuple[str, str]]:
         """Return every user that has a bound wallet.
 
         Returns:
-            ``(user_key, display_name, wallet)`` tuples, one per bound user.
+            ``(user_key, wallet)`` tuples, one per bound user.
         """
         async with self._lock:
             cursor = await self._conn.execute(
-                "SELECT user_key, display_name, wallet FROM users "
-                "WHERE wallet IS NOT NULL",
+                "SELECT user_key, wallet FROM users WHERE wallet IS NOT NULL",
             )
             rows = await cursor.fetchall()
             await cursor.close()
-        return [(r["user_key"], r["display_name"], r["wallet"]) for r in rows]
+        return [(r["user_key"], r["wallet"]) for r in rows]
 
     async def transfer_balance(
         self,
@@ -290,8 +280,8 @@ class FaucetStore:
         user can receive tokens before their first check-in.
 
         Args:
-            from_key: Sender's ``platform:sender_id`` identifier.
-            to_key: Recipient's ``platform:sender_id`` identifier.
+            from_key: Sender's stable identifier.
+            to_key: Recipient's stable identifier.
             amount: Number of tokens to move; must be positive.
 
         Returns:
@@ -370,7 +360,7 @@ class FaucetStore:
         than an untracked payout.
 
         Args:
-            user_key: Stable ``platform:sender_id`` identifier.
+            user_key: Stable sender identifier.
             to_address: Checksummed destination address.
             amount: Number of tokens to withdraw.
             day: Faucet day string from :func:`current_day`.
@@ -531,7 +521,7 @@ class FaucetStore:
         """Return a user's most recent withdrawals, newest first.
 
         Args:
-            user_key: Stable ``platform:sender_id`` identifier.
+            user_key: Stable sender identifier.
             limit: Maximum number of rows to return.
 
         Returns:

@@ -69,17 +69,19 @@ class TokenFaucet(Star):
     def _user_key(self, event: AstrMessageEvent) -> str:
         """Build a stable cross-session identity for a sender.
 
-        The platform id is included so the same numeric user id on two
-        platforms never collides, and the session/group is deliberately left
-        out so a user's balance follows them across groups.
+        Only the sender id (the QQ number on OneBot) is stored. The platform
+        adapter id is deliberately excluded: it changes whenever the adapter
+        is re-created or renamed, which would orphan every ledger row. The
+        group/session is also excluded so a user's balance follows them
+        across groups and private chats.
 
         Args:
             event: The incoming message event.
 
         Returns:
-            A ``platform:sender_id`` key.
+            The sender id as a string.
         """
-        return f"{event.get_platform_id()}:{event.get_sender_id()}"
+        return str(event.get_sender_id())
 
     def _explorer_tx(self, tx_hash: str) -> str:
         base = str(self._chain_cfg().get("explorer_base") or "").rstrip("/")
@@ -195,11 +197,7 @@ class TokenFaucet(Star):
 
         checksummed = TokenChainClient.to_checksum(address)
         try:
-            await self._store.set_wallet(
-                self._user_key(event),
-                checksummed,
-                event.get_sender_name(),
-            )
+            await self._store.set_wallet(self._user_key(event), checksummed)
         except Exception as exc:
             logger.error(f"Wallet binding failed: {exc}")
             yield event.plain_result("绑定失败，请稍后再试。")
@@ -298,7 +296,7 @@ class TokenFaucet(Star):
         amount = int(amount_text)
 
         sender_key = self._user_key(event)
-        target_key = f"{event.get_platform_id()}:{target_id}"
+        target_key = target_id
         if target_key == sender_key:
             yield event.plain_result("不能转账给自己。")
             return
@@ -552,6 +550,21 @@ class TokenFaucet(Star):
             yield event.plain_result("链上查询失败，请稍后再试。")
             return
 
+        # Group-card names are resolved live from the group the command was
+        # sent in: members of that group show their group nickname, everyone
+        # else (and every entry in a private chat) shows only the address.
+        member_names: dict[str, str] = {}
+        if event.get_group_id():
+            try:
+                group = await event.get_group()
+                if group and group.members:
+                    member_names = {
+                        str(m.user_id): (m.nickname or "").strip()
+                        for m in group.members
+                    }
+            except Exception as exc:
+                logger.warning(f"Rank group member lookup failed: {exc}")
+
         # Balances come from the bound addresses, not from a holders API:
         # standard RPC nodes cannot enumerate token holders, and the board
         # only shows bound users anyway. Capped concurrency keeps a long
@@ -566,16 +579,15 @@ class TokenFaucet(Star):
                     logger.warning(f"Rank balance failed for {wallet}: {exc}")
                     return None
 
-        balances = await asyncio.gather(*[query_balance(w) for _, _, w in bound])
+        balances = await asyncio.gather(*[query_balance(w) for _, w in bound])
 
         entries = []
         failed = 0
-        for (user_key, name, wallet), balance in zip(bound, balances):
+        for (user_key, wallet), balance in zip(bound, balances):
             if balance is None:
                 failed += 1
             elif balance > 0:
-                display = name or user_key.split(":", 1)[-1]
-                entries.append((display, wallet, balance))
+                entries.append((user_key, wallet, balance))
         entries.sort(key=lambda e: e[2], reverse=True)
 
         if not entries:
@@ -588,10 +600,12 @@ class TokenFaucet(Star):
             return
 
         lines = [f"{self._symbol} 持有排行榜（仅统计已绑定钱包的用户）"]
-        for i, (display, wallet, balance) in enumerate(entries[:10], start=1):
+        for i, (user_key, wallet, balance) in enumerate(entries[:10], start=1):
             pct = balance / supply * 100 if supply else 0.0
+            name = member_names.get(user_key, "")
+            prefix = f"{name} " if name else ""
             lines.append(
-                f"{i}. {display} {wallet[:6]}…{wallet[-4:]}："
+                f"{i}. {prefix}{wallet[:6]}…{wallet[-4:]}："
                 f"{balance} {self._symbol}（{pct:.2f}%）",
             )
         if failed:
