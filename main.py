@@ -9,7 +9,7 @@ from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At
+from astrbot.api.message_components import At, Plain
 from astrbot.api.star import Context, Star, StarTools
 
 from .chain import ChainError, TokenChainClient
@@ -153,6 +153,15 @@ class TokenFaucet(Star):
     @filter.command("签到")
     async def cmd_checkin(self, event: AstrMessageEvent):
         """每日签到，随机获得游戏币。"""
+        # In a group several members often check in within seconds of each
+        # other, so every reply leads with a mention of the sender to make
+        # clear whose numbers these are. Private chats need no disambiguation.
+        mention = (
+            [At(qq=event.get_sender_id(), name=event.get_sender_name()), Plain("\n")]
+            if event.get_group_id()
+            else []
+        )
+
         faucet = self._faucet_cfg()
         low = self._int_cfg(faucet, "checkin_min", 1)
         high = self._int_cfg(faucet, "checkin_max", 3)
@@ -169,18 +178,29 @@ class TokenFaucet(Star):
             )
         except Exception as exc:
             logger.error(f"Check-in failed: {exc}")
-            yield event.plain_result("签到失败，请稍后再试。")
+            yield event.chain_result([*mention, Plain("签到失败，请稍后再试。")])
             return
 
         if not ok:
-            yield event.plain_result(
-                f"今天已经签到过了，明天再来吧。\n当前余额：{balance} {self._symbol}",
+            yield event.chain_result(
+                [
+                    *mention,
+                    Plain(
+                        f"今天已经签到过了，明天再来吧。\n"
+                        f"当前余额：{balance} {self._symbol}",
+                    ),
+                ],
             )
             return
 
-        yield event.plain_result(
-            f"签到成功，获得 {amount} {self._symbol}！\n"
-            f"当前余额：{balance} {self._symbol}",
+        yield event.chain_result(
+            [
+                *mention,
+                Plain(
+                    f"签到成功，获得 {amount} {self._symbol}！\n"
+                    f"当前余额：{balance} {self._symbol}",
+                ),
+            ],
         )
 
     @filter.command("绑定钱包")
