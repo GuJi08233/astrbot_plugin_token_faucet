@@ -56,6 +56,19 @@ CREATE TABLE IF NOT EXISTS checkins (
     created_at INTEGER NOT NULL,
     PRIMARY KEY (user_key, day)
 );
+
+CREATE TABLE IF NOT EXISTS grants (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_key   TEXT NOT NULL,
+    amount     INTEGER NOT NULL,
+    source     TEXT NOT NULL,
+    reason     TEXT,
+    day        TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_grants_cap ON grants (user_key, source, day);
+CREATE INDEX IF NOT EXISTS idx_grants_user ON grants (user_key, id DESC);
 """
 
 
@@ -231,6 +244,101 @@ class FaucetStore:
                 await self._conn.rollback()
                 raise
         return True, int(row["balance"]) if row else amount
+
+    async def grant(
+        self,
+        user_key: str,
+        display_name: str,
+        amount: int,
+        source: str,
+        reason: str,
+        day: str,
+        daily_cap: int = 0,
+    ) -> tuple[int, int]:
+        """Credit tokens awarded by another plugin.
+
+        The daily cap is read and written inside one transaction, so two
+        rounds settling at the same moment cannot both clear a stale check
+        and together overshoot it.
+
+        Args:
+            user_key: Stable sender identifier.
+            display_name: Latest known nickname; blank keeps the stored one.
+            amount: Tokens requested. Values below 1 credit nothing.
+            source: Granting plugin, which also scopes the cap.
+            reason: Human-readable note, kept for auditing.
+            day: Faucet day string from :func:`current_day`.
+            daily_cap: Per-user, per-source ceiling for ``day``. 0 disables it.
+
+        Returns:
+            ``(granted, new_balance)``. ``granted`` is 0 once the cap is
+            reached, and smaller than ``amount`` when the cap partly bites.
+        """
+        if amount < 1:
+            user = await self.get_user(user_key)
+            return 0, user.balance
+
+        now = int(time.time())
+        async with self._lock:
+            await self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                granted = amount
+                if daily_cap > 0:
+                    cursor = await self._conn.execute(
+                        "SELECT COALESCE(SUM(amount), 0) AS used FROM grants "
+                        "WHERE user_key = ? AND source = ? AND day = ?",
+                        (user_key, source, day),
+                    )
+                    row = await cursor.fetchone()
+                    await cursor.close()
+                    used = int(row["used"]) if row else 0
+                    granted = max(0, min(amount, daily_cap - used))
+
+                if granted < 1:
+                    cursor = await self._conn.execute(
+                        "SELECT balance FROM users WHERE user_key = ?",
+                        (user_key,),
+                    )
+                    row = await cursor.fetchone()
+                    await cursor.close()
+                    await self._conn.rollback()
+                    return 0, int(row["balance"]) if row else 0
+
+                await self._conn.execute(
+                    "INSERT INTO grants "
+                    "(user_key, amount, source, reason, day, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (user_key, granted, source, reason, day, now),
+                )
+                await self._conn.execute(
+                    """
+                    INSERT INTO users (
+                        user_key, display_name, balance,
+                        total_earned, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_key) DO UPDATE SET
+                        display_name = CASE
+                            WHEN excluded.display_name != ''
+                            THEN excluded.display_name
+                            ELSE users.display_name
+                        END,
+                        balance = users.balance + excluded.balance,
+                        total_earned = users.total_earned + excluded.total_earned,
+                        updated_at = excluded.updated_at
+                    """,
+                    (user_key, display_name, granted, granted, now, now),
+                )
+                cursor = await self._conn.execute(
+                    "SELECT balance FROM users WHERE user_key = ?",
+                    (user_key,),
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                await self._conn.commit()
+            except Exception:
+                await self._conn.rollback()
+                raise
+        return granted, int(row["balance"]) if row else granted
 
     async def set_wallet(self, user_key: str, wallet: str | None) -> None:
         """Bind or clear a user's payout address.

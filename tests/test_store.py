@@ -234,6 +234,83 @@ async def test_list_bound_wallets(store: FaucetStore):
     assert await store.list_bound_wallets() == [("222", "0xbbbb")]
 
 
+@pytest.mark.asyncio
+async def test_grant_credits_balance_and_counts_as_earned(store: FaucetStore):
+    granted, balance = await store.grant("p:u1", "tester", 7, "soupai", "round", DAY)
+    assert (granted, balance) == (7, 7)
+
+    user = await store.get_user("p:u1")
+    assert user.total_earned == 7
+    assert user.checkin_count == 0, "a grant is not a check-in"
+
+
+@pytest.mark.asyncio
+async def test_grant_is_clipped_by_the_daily_cap(store: FaucetStore):
+    granted, _ = await store.grant("p:u1", "t", 30, "soupai", "r", DAY, daily_cap=50)
+    assert granted == 30
+
+    # The second round only gets what is left of the cap, not the full ask.
+    granted, balance = await store.grant(
+        "p:u1", "t", 30, "soupai", "r", DAY, daily_cap=50
+    )
+    assert (granted, balance) == (20, 50)
+
+    granted, _ = await store.grant("p:u1", "t", 5, "soupai", "r", DAY, daily_cap=50)
+    assert granted == 0
+
+
+@pytest.mark.asyncio
+async def test_grant_cap_is_scoped_to_source_and_day(store: FaucetStore):
+    await store.grant("p:u1", "t", 50, "soupai", "r", DAY, daily_cap=50)
+
+    other_game, _ = await store.grant("p:u1", "t", 10, "quiz", "r", DAY, daily_cap=50)
+    assert other_game == 10, "another plugin has its own allowance"
+
+    tomorrow, _ = await store.grant(
+        "p:u1", "t", 10, "soupai", "r", "2026-08-29", daily_cap=50
+    )
+    assert tomorrow == 10, "the cap resets with the faucet day"
+
+
+@pytest.mark.asyncio
+async def test_grant_ignores_non_positive_amounts(store: FaucetStore):
+    await _credit(store, "p:u1", 4)
+
+    assert await store.grant("p:u1", "t", 0, "soupai", "r", DAY) == (0, 4)
+    assert await store.grant("p:u1", "t", -5, "soupai", "r", DAY) == (0, 4)
+
+
+@pytest.mark.asyncio
+async def test_grant_keeps_the_stored_name_when_none_is_supplied(store: FaucetStore):
+    await store.grant("p:u1", "Player One", 3, "soupai", "r", DAY)
+    await store.grant("p:u1", "", 3, "soupai", "r", DAY)
+
+    cursor = await store._conn.execute(
+        "SELECT display_name FROM users WHERE user_key = ?", ("p:u1",)
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    assert row["display_name"] == "Player One"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_grants_never_exceed_the_cap(store: FaucetStore):
+    """Ten simultaneous 10-token grants against a 50 cap.
+
+    This is the case that breaks if the cap lookup and the insert are not
+    inside one transaction: every caller would read the same stale total.
+    """
+    results = await asyncio.gather(
+        *[
+            store.grant("p:u1", "t", 10, "soupai", "r", DAY, daily_cap=50)
+            for _ in range(10)
+        ]
+    )
+
+    assert sum(granted for granted, _ in results) == 50
+    assert (await store.get_user("p:u1")).balance == 50
+
+
 def test_current_day_uses_offset():
     """The day string must follow the configured offset, not the host clock."""
     assert len(current_day(8)) == 10

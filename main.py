@@ -147,6 +147,68 @@ class TokenFaucet(Star):
         return self._client
 
     # ------------------------------------------------------------------ #
+    # Public API for other plugins
+    # ------------------------------------------------------------------ #
+
+    async def grant(
+        self,
+        user_key: str,
+        amount: int,
+        *,
+        source: str,
+        reason: str = "",
+        display_name: str = "",
+        daily_cap: int = 0,
+    ) -> int:
+        """Credit tokens a user earned inside another plugin.
+
+        Callers reach this through ``get_registered_star(...).star_cls``, so
+        every argument arrives from code this plugin does not control and is
+        validated here rather than trusted. Only the in-plugin balance moves:
+        the on-chain withdrawal limits still apply afterwards, so a caller
+        that goes wrong cannot drain the hot wallet any faster than /提现
+        already allows.
+
+        Args:
+            user_key: Sender id, in the same form :meth:`_user_key` builds.
+            amount: Tokens to credit. Anything below 1 is a no-op.
+            source: Short id of the granting plugin; also scopes ``daily_cap``.
+            reason: Human-readable note kept in the ledger for auditing.
+            display_name: Latest known nickname; blank keeps the stored one.
+            daily_cap: Per-user ceiling for this source today. 0 disables it.
+
+        Returns:
+            The number of tokens actually credited, which is 0 when the
+            request was invalid or the daily cap is already used up.
+        """
+        key = str(user_key or "").strip()
+        marker = str(source or "").strip()
+        if not key or not marker:
+            logger.warning("Token faucet grant rejected: missing user or source")
+            return 0
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 1:
+            return 0
+        cap = daily_cap if isinstance(daily_cap, int) and daily_cap > 0 else 0
+
+        try:
+            granted, _ = await self._store.grant(
+                key,
+                str(display_name or ""),
+                amount,
+                marker,
+                str(reason or "")[:200],
+                self._day,
+                cap,
+            )
+        except Exception as exc:
+            logger.error(f"Token faucet grant failed for {marker}: {exc}")
+            return 0
+
+        if granted:
+            logger.info(f"Token faucet granted {granted} to {key} from {marker}")
+        return granted
+
+    # ------------------------------------------------------------------ #
     # Commands
     # ------------------------------------------------------------------ #
 

@@ -58,13 +58,41 @@
 
 余额扣减与额度检查在同一个 `BEGIN IMMEDIATE` 事务内完成，链上发送串行化以避免 nonce 冲突——并发提现不会击穿限额，也不会互相顶掉交易。
 
+## 给其他插件发币
+
+其他插件可以把玩家在自己那边赚到的币记进来，用于游戏奖励、活动发放之类。
+
+```python
+star = self.context.get_registered_star("astrbot_plugin_token_faucet")
+grant = getattr(getattr(star, "star_cls", None), "grant", None)
+if callable(grant):
+    granted = await grant(
+        user_key,              # 发送者 ID，与本插件的 _user_key 同一口径
+        amount,                # 请求发放的数量，正整数
+        source="soupai",       # 发放方标识，日限额按它分别计算
+        reason="海龟汤对局贡献",  # 审计用备注
+        display_name="玩家昵称",  # 可留空，留空则保留已存的昵称
+        daily_cap=100,         # 该来源每人每日上限，0 表示不限
+    )
+```
+
+返回**实际入账**的数量，可能小于请求值（日限额只剩一部分）或为 0（已达上限、参数不合法）。调用方应按返回值播报，报请求值会让玩家查不到账。
+
+几点约定：
+
+- 入账的是**站内余额**，不直接上链。提现仍然走 `/提现`，受单次上下限和每日全局限额约束——调用方出问题也不会比 `/提现` 本身更快掏空热钱包。
+- 参数不被信任，一律在本插件内校验；异常只记日志并返回 0，不向调用方抛。
+- 日限额的读取与写入在同一个事务内完成，并发发放不会超发。
+- `total_earned` 会累加，`checkin_count` 不会——发币不是签到。
+
 ## 数据存储
 
-SQLite 数据库位于 `data/plugin_data/astrbot_plugin_token_faucet/faucet.db`，含三张表：
+SQLite 数据库位于 `data/plugin_data/astrbot_plugin_token_faucet/faucet.db`，含四张表：
 
 - `users`：余额、绑定地址、签到与提现累计
 - `withdrawals`：提现流水与链上状态
 - `checkins`：签到记录，`(user_key, day)` 主键保证每人每天仅一次
+- `grants`：其他插件发放的流水，按 `(user_key, source, day)` 统计日限额
 
 用户身份为发送者 ID（OneBot 下即 QQ 号），不含平台适配器 ID 与群号——重建或改名适配器不影响数据，同一用户在不同群、私聊共用同一个余额。
 
@@ -74,4 +102,4 @@ SQLite 数据库位于 `data/plugin_data/astrbot_plugin_token_faucet/faucet.db`�
 python -m pytest tests/ --asyncio-mode=auto -q
 ```
 
-测试覆盖签到幂等、并发签到、余额不足拒绝、退款与重复退款、已确认不可退款、并发提现的日限额守恒、额度按日重置、崩溃恢复。均为纯本地 SQLite 测试，不访问网络。
+测试覆盖签到幂等、并发签到、余额不足拒绝、退款与重复退款、已确认不可退款、并发提现的日限额守恒、额度按日重置、崩溃恢复，以及外部发放的入账、日限额削减、按来源与按日分别计算、并发发放不超发。均为纯本地 SQLite 测试，不访问网络。
