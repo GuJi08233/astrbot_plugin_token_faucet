@@ -315,3 +315,153 @@ def test_current_day_uses_offset():
     """The day string must follow the configured offset, not the host clock."""
     assert len(current_day(8)) == 10
     assert current_day(8) >= current_day(-12)
+
+
+@pytest.mark.asyncio
+async def test_api_user_binding_roundtrip(store: FaucetStore):
+    await store.set_api_user("p:u1", 147)
+    assert (await store.get_user("p:u1")).api_user_id == 147
+
+    await store.set_api_user("p:u1", 233)
+    assert (await store.get_user("p:u1")).api_user_id == 233, (
+        "rebinding must overwrite the previous id"
+    )
+
+    await store.set_api_user("p:u1", None)
+    assert (await store.get_user("p:u1")).api_user_id is None
+
+
+@pytest.mark.asyncio
+async def test_recharge_rejects_insufficient_balance(store: FaucetStore):
+    await _credit(store, "p:u1", 5)
+
+    rid, reason, value = await store.reserve_recharge(
+        "p:u1", 147, 10, 5_000_000, DAY, 500
+    )
+    assert rid is None
+    assert reason == "insufficient_balance"
+    assert value == 5
+    assert (await store.get_user("p:u1")).balance == 5
+
+
+@pytest.mark.asyncio
+async def test_recharge_debits_and_refund_restores(store: FaucetStore):
+    await _credit(store, "p:u1", 10)
+
+    rid, reason, remaining = await store.reserve_recharge(
+        "p:u1", 147, 4, 2_000_000, DAY, 500
+    )
+    assert rid is not None and reason == "ok"
+    assert remaining == 496
+    assert (await store.get_user("p:u1")).balance == 6, (
+        "reservation must debit immediately"
+    )
+
+    await store.mark_recharged(rid)
+    assert (await store.get_user("p:u1")).balance == 6, "a top-up is final"
+
+    rid2, _, _ = await store.reserve_recharge("p:u1", 147, 3, 1_500_000, DAY, 500)
+    await store.refund_recharge(rid2, "api down")
+    assert (await store.get_user("p:u1")).balance == 6, (
+        "refund must restore the coins"
+    )
+    assert await store.daily_recharge_used(DAY) == 4, (
+        "refund must release the daily quota again"
+    )
+
+
+@pytest.mark.asyncio
+async def test_double_recharge_refund_does_not_mint(store: FaucetStore):
+    await _credit(store, "p:u1", 10)
+    rid, _, _ = await store.reserve_recharge("p:u1", 147, 4, 2_000_000, DAY, 500)
+
+    await store.refund_recharge(rid, "first")
+    await store.refund_recharge(rid, "second")
+
+    assert (await store.get_user("p:u1")).balance == 10, (
+        "a second refund must be a no-op"
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirmed_recharge_cannot_be_refunded(store: FaucetStore):
+    await _credit(store, "p:u1", 10)
+    rid, _, _ = await store.reserve_recharge("p:u1", 147, 4, 2_000_000, DAY, 500)
+
+    await store.mark_recharged(rid)
+    await store.refund_recharge(rid, "late failure")
+
+    assert (await store.get_user("p:u1")).balance == 6, (
+        "a successful recharge must never be refunded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_recharges_never_overdraw(store: FaucetStore):
+    """Ten simultaneous 30-coin recharges from a 100 balance: exactly 3 pass."""
+    await _credit(store, "p:alice", 100)
+
+    results = await asyncio.gather(
+        *[
+            store.reserve_recharge("p:alice", 147, 30, 15_000_000, DAY, 500)
+            for _ in range(10)
+        ]
+    )
+    approved = [rid for rid, _, _ in results if rid is not None]
+    assert len(approved) == 3, f"expected 3 approvals, got {len(approved)}"
+    assert (await store.get_user("p:alice")).balance == 10
+
+
+@pytest.mark.asyncio
+async def test_recharge_daily_limit_holds_under_concurrency(store: FaucetStore):
+    """Ten simultaneous 100-coin recharges against a 500 cap: exactly 5 pass."""
+    for i in range(10):
+        await _credit(store, f"p:u{i}", 100)
+
+    results = await asyncio.gather(
+        *[
+            store.reserve_recharge(f"p:u{i}", 147, 100, 50_000_000, DAY, 500)
+            for i in range(10)
+        ]
+    )
+    approved = [rid for rid, _, _ in results if rid is not None]
+    assert len(approved) == 5, f"expected 5 approvals, got {len(approved)}"
+    assert await store.daily_recharge_used(DAY) == 500
+
+    # A funded user outside the race can only be rejected by the quota.
+    await _credit(store, "p:fresh", 50)
+    rid, reason, remaining = await store.reserve_recharge(
+        "p:fresh", 147, 1, 500_000, DAY, 500
+    )
+    assert rid is None
+    assert reason == "daily_limit"
+    assert remaining == 0
+
+
+@pytest.mark.asyncio
+async def test_recharge_quota_is_per_day(store: FaucetStore):
+    await _credit(store, "p:u1", 200)
+    await store.reserve_recharge("p:u1", 147, 100, 50_000_000, DAY, 500)
+
+    assert await store.daily_recharge_used(DAY) == 100
+    assert await store.daily_recharge_used("2026-08-29") == 0, (
+        "the recharge limit must reset per day"
+    )
+    rid, reason, _ = await store.reserve_recharge(
+        "p:u1", 147, 100, 50_000_000, "2026-08-29", 500
+    )
+    assert rid is not None and reason == "ok", "the next day gets a fresh cap"
+
+
+@pytest.mark.asyncio
+async def test_stale_pending_recharge_is_recoverable(store: FaucetStore):
+    await _credit(store, "p:u1", 10)
+    rid, _, _ = await store.reserve_recharge("p:u1", 147, 4, 2_000_000, DAY, 500)
+
+    assert await store.find_stale_pending_recharges(max_age_seconds=-1) == [rid]
+    assert await store.find_stale_pending_recharges(max_age_seconds=3600) == []
+
+    await store.mark_recharged(rid)
+    assert await store.find_stale_pending_recharges(max_age_seconds=-1) == [], (
+        "a finished recharge is no longer pending and must not be refunded"
+    )

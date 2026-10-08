@@ -59,6 +59,36 @@
       }
     }
   },
+  "newapi": {
+    "description": "new-api 充值配置",
+    "type": "object",
+    "items": {
+      "base_url": {
+        "description": "new-api 站点地址",
+        "hint": "例如 https://api.guji.uno，末尾不带斜杠。",
+        "type": "string",
+        "default": "https://api.guji.uno"
+      },
+      "admin_user_id": {
+        "description": "管理员用户 ID",
+        "hint": "系统访问令牌所属账号的用户 ID，即请求头 new-api-user 的值。",
+        "type": "int",
+        "default": 0
+      },
+      "access_token": {
+        "description": "系统访问令牌",
+        "hint": "在 new-api「个人设置 → 系统访问令牌」中生成，权限等同该账号本人。以明文保存在 data/config 下，泄露即等于账号泄露。",
+        "obvious_hint": true,
+        "type": "string",
+        "default": ""
+      },
+      "request_timeout": {
+        "description": "请求超时（秒）",
+        "type": "int",
+        "default": 30
+      }
+    }
+  },
   "faucet": {
     "description": "签到与提现规则",
     "type": "object",
@@ -95,6 +125,28 @@
         "hint": "防止单个用户一次性抽空当日额度。",
         "type": "int",
         "default": 100
+      },
+      "recharge_rate": {
+        "description": "充值兑换比率",
+        "hint": "1 个游戏币可兑换的 new-api 额度（quota）。500000 quota = 1 美元，默认即 1 币 = $1。",
+        "type": "int",
+        "default": 500000
+      },
+      "recharge_min": {
+        "description": "单次充值最少游戏币",
+        "type": "int",
+        "default": 1
+      },
+      "recharge_max": {
+        "description": "单次充值最多游戏币",
+        "type": "int",
+        "default": 100
+      },
+      "recharge_daily_limit": {
+        "description": "每日全局充值上限",
+        "hint": "所有用户当天充值消耗的游戏币总量上限。失败并已退款的充值不占用额度。",
+        "type": "int",
+        "default": 500
       },
       "day_utc_offset": {
         "description": "每日重置时区偏移（UTC±N 小时）",

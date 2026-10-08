@@ -13,6 +13,7 @@ from astrbot.api.message_components import At, Plain
 from astrbot.api.star import Context, Star, StarTools
 
 from .chain import ChainError, TokenChainClient
+from .newapi import QUOTA_PER_USD, NewApiClient, NewApiError
 from .store import FaucetStore, current_day
 
 # Grace period after which a withdrawal still stuck in `pending` is treated as
@@ -29,6 +30,8 @@ class TokenFaucet(Star):
         self._store = FaucetStore(Path(StarTools.get_data_dir()) / "faucet.db")
         self._client: TokenChainClient | None = None
         self._chain_error: str | None = None
+        self._newapi: NewApiClient | None = None
+        self._newapi_error: str | None = None
         self._bg_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------ #
@@ -40,6 +43,9 @@ class TokenFaucet(Star):
 
     def _faucet_cfg(self) -> dict:
         return self._config.get("faucet", {}) or {}
+
+    def _newapi_cfg(self) -> dict:
+        return self._config.get("newapi", {}) or {}
 
     def _int_cfg(self, section: dict, key: str, default: int) -> int:
         """Read an integer config value, falling back on malformed input.
@@ -92,7 +98,7 @@ class TokenFaucet(Star):
     # ------------------------------------------------------------------ #
 
     async def initialize(self) -> None:
-        """Open the ledger, build the chain client and recover stale rows."""
+        """Open the ledger, build the API clients and recover stale rows."""
         await self._store.open()
 
         chain = self._chain_cfg()
@@ -111,8 +117,20 @@ class TokenFaucet(Star):
             self._chain_error = str(exc)
             logger.warning(f"Token faucet chain client unavailable: {exc}")
 
+        newapi = self._newapi_cfg()
+        try:
+            self._newapi = NewApiClient(
+                base_url=str(newapi.get("base_url", "")),
+                admin_user_id=self._int_cfg(newapi, "admin_user_id", 0),
+                access_token=str(newapi.get("access_token", "")),
+                request_timeout=float(self._int_cfg(newapi, "request_timeout", 30)),
+            )
+        except NewApiError as exc:
+            self._newapi_error = str(exc)
+            logger.warning(f"Token faucet new-api client unavailable: {exc}")
+
         # A row left in `pending` means the process died between debiting the
-        # user and broadcasting, so the tokens were never sent out.
+        # user and the remote call, so the payout never happened.
         try:
             stale = await self._store.find_stale_pending(STALE_PENDING_SECONDS)
             for withdrawal_id in stale:
@@ -120,6 +138,16 @@ class TokenFaucet(Star):
             if stale:
                 logger.warning(
                     f"Token faucet refunded {len(stale)} stale pending withdrawals",
+                )
+            stale_recharges = await self._store.find_stale_pending_recharges(
+                STALE_PENDING_SECONDS,
+            )
+            for recharge_id in stale_recharges:
+                await self._store.refund_recharge(recharge_id, "recovered on startup")
+            if stale_recharges:
+                logger.warning(
+                    f"Token faucet refunded {len(stale_recharges)} "
+                    "stale pending recharges",
                 )
         except Exception as exc:
             logger.error(f"Token faucet startup recovery failed: {exc}")
@@ -131,6 +159,8 @@ class TokenFaucet(Star):
         self._bg_tasks.clear()
         if self._client is not None:
             await self._client.close()
+        if self._newapi is not None:
+            await self._newapi.close()
         await self._store.close()
 
     def _spawn(self, coro) -> None:
@@ -300,6 +330,172 @@ class TokenFaucet(Star):
             return
         yield event.plain_result("已解绑钱包地址。")
 
+    @filter.command("绑定")
+    async def cmd_bind_api(
+        self,
+        event: AstrMessageEvent,
+        api_user_id: str = "",
+        username: str = "",
+    ):
+        """绑定用于充值的 new-api 账号：/绑定 <ID> <用户名>。"""
+        text = api_user_id.strip()
+        name = username.strip()
+        if not text.isdigit() or int(text) < 1 or not name:
+            yield event.plain_result(
+                "用法：/绑定 <new-api 用户 ID> <用户名>（均在面板个人资料页可见）"
+            )
+            return
+        if int(text) == 1:
+            # id 1 is new-api's built-in root account; nothing may be topped
+            # up into it from the faucet.
+            yield event.plain_result("该 ID 不可绑定，请使用你自己的 new-api 用户 ID。")
+            return
+
+        client = self._newapi
+        if client is None:
+            yield event.plain_result(
+                "充值功能当前不可用，请联系管理员完成 new-api 配置后再绑定。"
+            )
+            return
+
+        user_id = int(text)
+        # Double proof of ownership: the binding is stored only when new-api
+        # confirms the id exists AND its username matches, so guessing a
+        # stranger's numeric id cannot redirect /充值 into their account.
+        try:
+            info = await client.get_user(user_id)
+        except NewApiError as exc:
+            yield event.plain_result(
+                f"未能确认该账号（{exc}），未绑定，请检查 ID 后重试。"
+            )
+            return
+        real_name = str(info.get("username") or "").strip()
+        if real_name != name:
+            # Do not echo the real username here: replying with it would let
+            # anyone probe numeric ids for their owners.
+            yield event.plain_result("ID 与用户名不一致，未绑定，请核对后重试。")
+            return
+
+        try:
+            await self._store.set_api_user(self._user_key(event), user_id)
+        except Exception as exc:
+            logger.error(f"API account binding failed: {exc}")
+            yield event.plain_result("绑定失败，请稍后再试。")
+            return
+
+        yield event.plain_result(
+            f"new-api 账号绑定成功：ID {user_id}（用户名 {real_name}）\n"
+            f"之后可使用 /充值 <{self._symbol}数量> 为该账号充值额度。"
+        )
+
+    @filter.command("充值")
+    async def cmd_recharge(self, event: AstrMessageEvent, amount_text: str = ""):
+        """用游戏币为绑定的 new-api 账号充值：/充值 <数量>。"""
+        symbol = self._symbol
+        if not amount_text.isdigit() or int(amount_text) < 1:
+            yield event.plain_result(f"用法：/充值 <{symbol}数量>（正整数）")
+            return
+        amount = int(amount_text)
+
+        faucet = self._faucet_cfg()
+        rate = self._int_cfg(faucet, "recharge_rate", 500000)
+        client = self._newapi
+        if client is None or rate < 1:
+            logger.error(
+                f"Recharge rejected, new-api unavailable: {self._newapi_error}"
+            )
+            yield event.plain_result("充值功能当前不可用，请联系管理员检查插件配置。")
+            return
+
+        min_amount = self._int_cfg(faucet, "recharge_min", 1)
+        max_amount = self._int_cfg(faucet, "recharge_max", 100)
+        if amount < min_amount:
+            yield event.plain_result(f"单次充值最少 {min_amount} {symbol}。")
+            return
+        if amount > max_amount:
+            yield event.plain_result(f"单次充值最多 {max_amount} {symbol}。")
+            return
+
+        user_key = self._user_key(event)
+        try:
+            user = await self._store.get_user(user_key)
+        except Exception as exc:
+            logger.error(f"Recharge lookup failed: {exc}")
+            yield event.plain_result("查询失败，请稍后再试。")
+            return
+        if user.api_user_id is None:
+            yield event.plain_result(
+                "你还没有绑定 new-api 账号。\n请先 /绑定 <new-api 用户 ID> <用户名>。"
+            )
+            return
+
+        quota = amount * rate
+        # Confirm the target account still exists before touching the balance.
+        try:
+            await client.get_user(user.api_user_id)
+        except NewApiError as exc:
+            logger.warning(f"Recharge target check failed: {exc}")
+            yield event.plain_result(
+                f"暂时无法确认充值账号（{exc}），请稍后再试。未扣除{symbol}。"
+            )
+            return
+
+        daily_limit = self._int_cfg(faucet, "recharge_daily_limit", 500)
+        try:
+            recharge_id, reason, value = await self._store.reserve_recharge(
+                user_key,
+                user.api_user_id,
+                amount,
+                quota,
+                self._day,
+                daily_limit,
+            )
+        except Exception as exc:
+            logger.error(f"Recharge reservation failed: {exc}")
+            yield event.plain_result("充值失败，请稍后再试。")
+            return
+        if recharge_id is None:
+            if reason == "insufficient_balance":
+                yield event.plain_result(
+                    f"余额不足。当前余额 {value} {symbol}，本次需要 {amount} {symbol}。"
+                )
+            else:
+                yield event.plain_result(
+                    f"今日全局充值额度不足。\n"
+                    f"剩余额度：{value} {symbol}（每日上限 {daily_limit} {symbol}），"
+                    f"请明天再试。"
+                )
+            return
+
+        # The coins are already debited. From here every failure path must
+        # either complete the top-up or refund the reservation.
+        try:
+            await client.add_quota(user.api_user_id, quota)
+        except NewApiError as exc:
+            await self._store.refund_recharge(recharge_id, str(exc))
+            logger.error(f"Recharge top-up failed: {exc}")
+            yield event.plain_result(
+                f"充值失败，{amount} {symbol} 已退回余额。\n原因：{exc}"
+            )
+            return
+        except Exception as exc:
+            await self._store.refund_recharge(recharge_id, str(exc))
+            logger.error(f"Recharge top-up crashed: {exc}")
+            yield event.plain_result(f"充值失败，{amount} {symbol} 已退回余额。")
+            return
+
+        await self._store.mark_recharged(recharge_id)
+        balance_line = ""
+        try:
+            balance = (await self._store.get_user(user_key)).balance
+            balance_line = f"\n当前{symbol}余额：{balance}"
+        except Exception as exc:
+            logger.warning(f"Post-recharge balance lookup failed: {exc}")
+        yield event.plain_result(
+            f"充值成功：{amount} {symbol} → new-api 用户 {user.api_user_id}\n"
+            f"到账额度：{quota}（${quota / QUOTA_PER_USD:.2f}）{balance_line}"
+        )
+
     @filter.command("钱包")
     async def cmd_wallet(self, event: AstrMessageEvent):
         """查看个人信息：余额、累计签到/提现与绑定地址。"""
@@ -311,11 +507,15 @@ class TokenFaucet(Star):
             return
 
         wallet = user.wallet or "未绑定（提现时需指定地址）"
+        api_account = (
+            str(user.api_user_id) if user.api_user_id is not None else "未绑定"
+        )
         yield event.plain_result(
             f"余额：{user.balance} {self._symbol}\n"
             f"累计签到：{user.checkin_count} 次\n"
             f"累计提现：{user.total_withdrawn} {self._symbol}\n"
-            f"绑定地址：{wallet}",
+            f"绑定地址：{wallet}\n"
+            f"充值账号（new-api ID）：{api_account}",
         )
 
     @filter.command("余额")

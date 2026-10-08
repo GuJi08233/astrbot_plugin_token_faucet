@@ -19,12 +19,16 @@ import aiosqlite
 # silently burn the day's budget.
 QUOTA_STATUSES = ("pending", "sent", "confirmed")
 
+# Recharge states that occupy the daily recharge limit for the same reason.
+RECHARGE_QUOTA_STATUSES = ("pending", "success")
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     user_key         TEXT PRIMARY KEY,
     display_name     TEXT,
     balance          INTEGER NOT NULL DEFAULT 0,
     wallet           TEXT,
+    api_user_id      INTEGER,
     last_checkin_day TEXT,
     checkin_count    INTEGER NOT NULL DEFAULT 0,
     total_earned     INTEGER NOT NULL DEFAULT 0,
@@ -69,6 +73,22 @@ CREATE TABLE IF NOT EXISTS grants (
 
 CREATE INDEX IF NOT EXISTS idx_grants_cap ON grants (user_key, source, day);
 CREATE INDEX IF NOT EXISTS idx_grants_user ON grants (user_key, id DESC);
+
+CREATE TABLE IF NOT EXISTS recharges (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_key    TEXT NOT NULL,
+    api_user_id INTEGER NOT NULL,
+    amount      INTEGER NOT NULL,
+    quota       INTEGER NOT NULL,
+    day         TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    error       TEXT,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recharges_user ON recharges (user_key, id DESC);
+CREATE INDEX IF NOT EXISTS idx_recharges_day ON recharges (day, status);
 """
 
 
@@ -96,6 +116,7 @@ class UserRecord:
     user_key: str
     balance: int = 0
     wallet: str | None = None
+    api_user_id: int | None = None
     last_checkin_day: str | None = None
     checkin_count: int = 0
     total_earned: int = 0
@@ -128,6 +149,27 @@ class FaucetStore:
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
+        # Databases created before the corresponding features predate these
+        # columns; CREATE TABLE IF NOT EXISTS leaves them untouched, so add
+        # any missing column by hand.
+        for table, column, ddl in (
+            (
+                "users",
+                "api_user_id",
+                "ALTER TABLE users ADD COLUMN api_user_id INTEGER",
+            ),
+            (
+                "recharges",
+                "day",
+                "ALTER TABLE recharges ADD COLUMN day TEXT NOT NULL DEFAULT ''",
+            ),
+        ):
+            cursor = await self._db.execute(f"PRAGMA table_info({table})")
+            columns = {row[1] for row in await cursor.fetchall()}
+            await cursor.close()
+            if column not in columns:
+                await self._db.execute(ddl)
+                await self._db.commit()
 
     async def close(self) -> None:
         """Close the database connection if it is open."""
@@ -163,6 +205,7 @@ class FaucetStore:
             user_key=row["user_key"],
             balance=row["balance"],
             wallet=row["wallet"],
+            api_user_id=row["api_user_id"],
             last_checkin_day=row["last_checkin_day"],
             checkin_count=row["checkin_count"],
             total_earned=row["total_earned"],
@@ -358,6 +401,27 @@ class FaucetStore:
                     updated_at = excluded.updated_at
                 """,
                 (user_key, wallet, now, now),
+            )
+            await self._conn.commit()
+
+    async def set_api_user(self, user_key: str, api_user_id: int | None) -> None:
+        """Bind or clear a user's new-api account id for /充值.
+
+        Args:
+            user_key: Stable sender identifier.
+            api_user_id: The new-api user's numeric id, or ``None`` to unbind.
+        """
+        now = int(time.time())
+        async with self._lock:
+            await self._conn.execute(
+                """
+                INSERT INTO users (user_key, api_user_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_key) DO UPDATE SET
+                    api_user_id = excluded.api_user_id,
+                    updated_at = excluded.updated_at
+                """,
+                (user_key, api_user_id, now, now),
             )
             await self._conn.commit()
 
@@ -621,6 +685,161 @@ class FaucetStore:
                 await self._conn.rollback()
                 raise
 
+    async def reserve_recharge(
+        self,
+        user_key: str,
+        api_user_id: int,
+        amount: int,
+        quota: int,
+        day: str,
+        daily_limit: int,
+    ) -> tuple[int | None, str, int]:
+        """Debit the user, reserve daily recharge quota and record the row.
+
+        Mirrors :meth:`reserve_withdrawal`: the debit, the daily-limit check
+        and the ``pending`` insert happen in one transaction, so concurrent
+        ``/充值`` commands cannot overshoot either budget, and a crash leaves
+        a recoverable ``pending`` row instead of an untracked payout.
+
+        Args:
+            user_key: Stable sender identifier.
+            api_user_id: Target new-api user id.
+            amount: Game coins to deduct.
+            quota: new-api quota the coins buy, kept for the audit trail.
+            day: Faucet day string from :func:`current_day`.
+            daily_limit: Global per-day recharge cap in coins.
+
+        Returns:
+            ``(recharge_id, "ok", remaining_quota)`` on success. On
+            rejection, ``(None, reason, value)`` where reason is
+            ``"insufficient_balance"`` (value = current balance) or
+            ``"daily_limit"`` (value = remaining quota).
+        """
+        now = int(time.time())
+        placeholders = ",".join("?" * len(RECHARGE_QUOTA_STATUSES))
+        async with self._lock:
+            await self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await self._conn.execute(
+                    "SELECT balance FROM users WHERE user_key = ?",
+                    (user_key,),
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                balance = int(row["balance"]) if row else 0
+                if balance < amount:
+                    await self._conn.rollback()
+                    return None, "insufficient_balance", balance
+
+                cursor = await self._conn.execute(
+                    f"SELECT COALESCE(SUM(amount), 0) AS used FROM recharges "
+                    f"WHERE day = ? AND status IN ({placeholders})",
+                    (day, *RECHARGE_QUOTA_STATUSES),
+                )
+                quota_row = await cursor.fetchone()
+                await cursor.close()
+                used = int(quota_row["used"]) if quota_row else 0
+                remaining = daily_limit - used
+                if amount > remaining:
+                    await self._conn.rollback()
+                    return None, "daily_limit", max(remaining, 0)
+
+                await self._conn.execute(
+                    "UPDATE users SET balance = balance - ?, updated_at = ? "
+                    "WHERE user_key = ?",
+                    (amount, now, user_key),
+                )
+                cursor = await self._conn.execute(
+                    """
+                    INSERT INTO recharges (
+                        user_key, api_user_id, amount, quota, day, status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (user_key, api_user_id, amount, quota, day, now, now),
+                )
+                recharge_id = cursor.lastrowid
+                await cursor.close()
+                await self._conn.commit()
+            except Exception:
+                await self._conn.rollback()
+                raise
+        return recharge_id, "ok", remaining - amount
+
+    async def daily_recharge_used(self, day: str) -> int:
+        """Return how much of the daily recharge limit is already committed.
+
+        Args:
+            day: Faucet day string from :func:`current_day`.
+
+        Returns:
+            Sum of coin amounts in pending and successful recharges.
+        """
+        placeholders = ",".join("?" * len(RECHARGE_QUOTA_STATUSES))
+        async with self._lock:
+            cursor = await self._conn.execute(
+                f"SELECT COALESCE(SUM(amount), 0) AS used FROM recharges "
+                f"WHERE day = ? AND status IN ({placeholders})",
+                (day, *RECHARGE_QUOTA_STATUSES),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return int(row["used"]) if row else 0
+
+    async def mark_recharged(self, recharge_id: int) -> None:
+        """Record that the new-api top-up succeeded.
+
+        Args:
+            recharge_id: Row id returned by :meth:`reserve_recharge`.
+        """
+        now = int(time.time())
+        async with self._lock:
+            await self._conn.execute(
+                "UPDATE recharges SET status = 'success', updated_at = ? WHERE id = ?",
+                (now, recharge_id),
+            )
+            await self._conn.commit()
+
+    async def refund_recharge(self, recharge_id: int, error: str) -> None:
+        """Return a failed recharge's coins to the user.
+
+        Only a still-``pending`` row may be refunded; a successful top-up is
+        final because the quota has already left the admin account.
+
+        Args:
+            recharge_id: Row id returned by :meth:`reserve_recharge`.
+            error: Short failure reason stored for diagnostics.
+        """
+        now = int(time.time())
+        async with self._lock:
+            await self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await self._conn.execute(
+                    "SELECT user_key, amount, status FROM recharges WHERE id = ?",
+                    (recharge_id,),
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                # Only a still-reserved row may be refunded; refunding twice
+                # would mint coins out of nothing.
+                if row is None or row["status"] != "pending":
+                    await self._conn.rollback()
+                    return
+                await self._conn.execute(
+                    "UPDATE recharges SET status = 'failed', error = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (error[:500], now, recharge_id),
+                )
+                await self._conn.execute(
+                    "UPDATE users SET balance = balance + ?, updated_at = ? "
+                    "WHERE user_key = ?",
+                    (int(row["amount"]), now, row["user_key"]),
+                )
+                await self._conn.commit()
+            except Exception:
+                await self._conn.rollback()
+                raise
+
     async def list_withdrawals(
         self,
         user_key: str,
@@ -662,6 +881,32 @@ class FaucetStore:
             cursor = await self._conn.execute(
                 "SELECT id FROM withdrawals WHERE status = 'pending' "
                 "AND updated_at < ?",
+                (cutoff,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [int(row["id"]) for row in rows]
+
+    async def find_stale_pending_recharges(
+        self,
+        max_age_seconds: int = 300,
+    ) -> list[int]:
+        """Find recharges stuck in ``pending`` past a grace period.
+
+        Same reasoning as :meth:`find_stale_pending`: a row is ``pending``
+        only between the debit and the new-api reply, so an old row means
+        the process died mid-flight and the coins should go back.
+
+        Args:
+            max_age_seconds: Age past which a pending row is considered stale.
+
+        Returns:
+            The ids of stale pending recharges.
+        """
+        cutoff = int(time.time()) - max_age_seconds
+        async with self._lock:
+            cursor = await self._conn.execute(
+                "SELECT id FROM recharges WHERE status = 'pending' AND updated_at < ?",
                 (cutoff,),
             )
             rows = await cursor.fetchall()
